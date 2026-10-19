@@ -606,49 +606,48 @@ def run_audit(
     cmd = [
         sys.executable, "-m", "textaudit.cli",
         str(input_path),
-        "--label-column", label_col,
         "--out", str(out_dir),
     ]
-    if split_col.strip():
+    if label_col and label_col.strip():
+        cmd += ["--label-column", label_col.strip()]
+    if split_col and split_col.strip():
         cmd += ["--split-column", split_col.strip()]
-    if allowed_labels_path:
+    if allowed_labels_path and label_col and label_col.strip():
         cmd += ["--allowed-labels", str(allowed_labels_path)]
     if require_redacted:
         cmd += ["--require-redacted"]
 
     env = os.environ.copy()
 
-    if use_case and use_case.strip():
-        cmd += ["--use-case", use_case.strip()]
-        if provider_choice == "Google AI Studio / Gemini (free tier)":
-            cmd += ["--provider", "gemini", "--allow-remote"]
-            if gemini_model and gemini_model.strip():
-                cmd += ["--model", gemini_model.strip()]
-            if gemini_api_key and gemini_api_key.strip():
-                env["GEMINI_API_KEY"] = gemini_api_key.strip()
-        elif provider_choice == "Groq (recommended & fast)":
-            cmd += ["--provider", "groq", "--allow-remote"]
-            if groq_model and groq_model.strip():
-                cmd += ["--model", groq_model.strip()]
-            if groq_api_key and groq_api_key.strip():
-                env["GROQ_API_KEY"] = groq_api_key.strip()
-        elif provider_choice == "Local Ollama (free)":
-            cmd += [
-                "--provider", "local",
-                "--model", ollama_model.strip(),
-                "--base-url", "http://127.0.0.1:11434/v1",
-            ]
-        else:
-            # Hugging Face
-            cmd += ["--provider", "huggingface", "--allow-remote"]
-            if hf_model and hf_model.strip():
-                cmd += ["--model", hf_model.strip()]
-            if hf_token:
-                env["HF_TOKEN"] = hf_token
+    if not (use_case and use_case.strip()):
+        raise ValueError("A business context is required for LLM policy synthesis.")
+
+    cmd += ["--use-case", use_case.strip()]
+    if provider_choice == "Google AI Studio / Gemini (free tier)":
+        cmd += ["--provider", "gemini", "--allow-remote"]
+        if gemini_model and gemini_model.strip():
+            cmd += ["--model", gemini_model.strip()]
+        if gemini_api_key and gemini_api_key.strip():
+            env["GEMINI_API_KEY"] = gemini_api_key.strip()
+    elif provider_choice == "Groq (recommended & fast)":
+        cmd += ["--provider", "groq", "--allow-remote"]
+        if groq_model and groq_model.strip():
+            cmd += ["--model", groq_model.strip()]
+        if groq_api_key and groq_api_key.strip():
+            env["GROQ_API_KEY"] = groq_api_key.strip()
+    elif provider_choice == "Local Ollama (free)":
+        cmd += [
+            "--provider", "local",
+            "--model", ollama_model.strip(),
+            "--base-url", "http://127.0.0.1:11434/v1",
+        ]
     else:
-        # Reference policy — no model needed
-        p = policy_path or (WORKSPACE / "policies" / "classification_demo.json")
-        cmd += ["--policy", str(p)]
+        # Hugging Face
+        cmd += ["--provider", "huggingface", "--allow-remote"]
+        if hf_model and hf_model.strip():
+            cmd += ["--model", hf_model.strip()]
+        if hf_token:
+            env["HF_TOKEN"] = hf_token
 
     result = subprocess.run(cmd, capture_output=True, text=True,
                             cwd=str(WORKSPACE), env=env)
@@ -691,12 +690,13 @@ with st.sidebar:
             help="Supports CSV, TSV, JSON, JSONL, Parquet, Arrow, and plain TXT"
         )
         _dataset_path       = None
-        _label_col_default  = "label"
-        _split_col_default  = "split"
+        _label_col_default  = ""
+        _split_col_default  = ""
         _labels_path        = None
         _context_preset     = "Custom (type your own)"
         _policy_path        = None
         _require_redacted   = False
+        detected_cols       = []
         if uploaded_file is not None:
             st.caption(f"📄 Loaded file: `{uploaded_file.name}`")
             try:
@@ -718,177 +718,188 @@ with st.sidebar:
             except Exception:
                 pass
 
-    label_col = st.text_input("Label column", value=_label_col_default)
-    split_col = st.text_input("Split column (optional)", value=_split_col_default)
+    label_col = st.text_input("Label column (optional)", value=_label_col_default, help="Leave blank if dataset has no labels")
+    split_col = st.text_input("Split column (optional)", value=_split_col_default, help="Leave blank if dataset has no split column")
 
     st.divider()
 
     # ── Step 2: Business context ─────────────────────────────────────────────
-    st.markdown("### Step 2 · Business context")
+    st.markdown("### Step 2 · Business context (Mandatory LLM Policy)")
 
     if dataset_mode == "Use a bundled example":
         preset_choice = st.selectbox(
-            "Preset",
+            "Preset Context",
             list(EXAMPLE_CONTEXTS.keys()),
             index=list(EXAMPLE_CONTEXTS.keys()).index(_context_preset),
         )
         default_context = EXAMPLE_CONTEXTS[preset_choice]
-        if preset_choice in CONTEXT_OFFLINE_POLICIES:
-            _policy_path = CONTEXT_OFFLINE_POLICIES[preset_choice]["policy"]
-            _require_redacted = CONTEXT_OFFLINE_POLICIES[preset_choice]["require_redacted"]
     else:
-        preset_choice = "Custom (type your own)"
-        default_context = ""
+        template_choice = st.selectbox(
+            "Context Template (shortcut)",
+            [
+                "Custom (type below)",
+                "General Text Classification",
+                "Customer Support / FAQ Chat",
+                "Information Retrieval / Corpus",
+                "Medical / PII-Sensitive Notes",
+                "Legal Contract Extraction",
+            ],
+            help="Choose a context template or write your own business context below."
+        )
+        template_map = {
+            "Custom (type below)": "",
+            "General Text Classification": (
+                "Train an intent classifier. Missing labels and duplicate texts are unacceptable. "
+                "Enforce strict split disjointness to prevent train/test leakage."
+            ),
+            "Customer Support / FAQ Chat": (
+                "Customer support assistant routing common user queries. "
+                "Repetitive phrasing is expected, but zero tolerance for unredacted PII (emails/phones)."
+            ),
+            "Information Retrieval / Corpus": (
+                "Corpus for semantic search and document retrieval. Text completeness, encoding cleanliness, "
+                "and reasonable text lengths are paramount."
+            ),
+            "Medical / PII-Sensitive Notes": (
+                "Clinical transcription and patient records. Strict zero-tolerance for unredacted PII (emails, phones). "
+                "Corrupted encoding or missing texts must be rejected."
+            ),
+            "Legal Contract Extraction": (
+                "Clause extraction for commercial agreements. Short text fragments under 50 characters "
+                "are invalid noise. High uniqueness and clean encoding required."
+            ),
+        }
+        default_context = template_map.get(template_choice, "")
 
     business_context = st.text_area(
         "Describe what this dataset is for",
         value=default_context,
-        height=140,
+        height=130,
         placeholder=(
             "e.g. Train a banking intent classifier. "
             "Missing labels are unacceptable. "
-            "Prioritise split independence."
+            "Prioritise split independence and zero PII."
         ),
         help=(
-            "Leave blank or use pre-computed demo policies for instant offline evaluation (no API key needed). "
-            "Or toggle AI policy generation to have an LLM synthesize the policy."
+            "The LLM evaluates this description and your dataset schema to dynamically select "
+            "metric weights, threshold tolerances, and fatal blocking gates."
         ),
     )
 
-    # Allow users with AI keys to generate dynamic policies from prompt, or evaluate instantly with pre-computed policy
-    is_offline_preset = preset_choice in CONTEXT_OFFLINE_POLICIES or (dataset_mode == "Use a bundled example" and _policy_path is not None)
-    
-    if is_offline_preset:
-        use_ai = st.checkbox("Generate dynamic policy using LLM (instead of bundled policy)", value=False,
-                             help="Uncheck to run instantly offline using the pre-computed policy for this context. Check to call Groq/Ollama/HF.")
-    else:
-        use_ai = business_context.strip() != ""
+    st.info("The quality policy is always dynamically synthesized by the LLM based on your business context and dataset profile.", icon="🤖")
 
-    if use_ai:
-        st.info("AI policy will be generated dynamically by LLM.", icon="🤖")
+    provider_choice = st.selectbox(
+        "Inference provider",
+        [
+            "Google AI Studio / Gemini (free tier)",
+            "Groq (recommended & fast)",
+            "Local Ollama (free)",
+            "Hugging Face (paid)"
+        ],
+        help=(
+            "Google AI Studio: generous free tier with Gemini 2.5 / 3.8 Flash (aistudio.google.com). "
+            "Groq: ultra-fast inference (console.groq.com). "
+            "Ollama: runs locally offline. "
+            "Hugging Face: requires paid inference credits."
+        ),
+    )
 
-        provider_choice = st.selectbox(
-            "Inference provider",
-            [
-                "Google AI Studio / Gemini (free tier)",
-                "Groq (recommended & fast)",
-                "Local Ollama (free)",
-                "Hugging Face (paid)"
-            ],
-            help=(
-                "Google AI Studio: generous free tier with Gemini 2.5 Flash / Pro (aistudio.google.com). "
-                "Groq: ultra-fast inference (console.groq.com). "
-                "Ollama: runs locally offline. "
-                "Hugging Face: requires paid inference credits."
-            ),
+    if provider_choice == "Google AI Studio / Gemini (free tier)":
+        gemini_api_key = st.text_input(
+            "Google AI Studio API key (GEMINI_API_KEY)",
+            value=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", ""),
+            type="password",
+            help="Create for free at aistudio.google.com/app/apikey.",
         )
-
-        if provider_choice == "Google AI Studio / Gemini (free tier)":
-            gemini_api_key = st.text_input(
-                "Google AI Studio API key (GEMINI_API_KEY)",
-                value=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", ""),
-                type="password",
-                help="Create for free at aistudio.google.com/app/apikey.",
-            )
-            live_gemini = get_available_gemini_models(gemini_api_key)
-            if live_gemini:
-                prioritized = [m for m in ("gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash", "gemini-2.0-flash") if m in live_gemini]
-                rest = [m for m in live_gemini if m not in prioritized]
-                gemini_models = (prioritized or ["gemini-3.8-flash"]) + rest + ["Custom (type your own)"]
-            else:
-                gemini_models = [
-                    "gemini-3.8-flash",
-                    "gemini-3.8-pro",
-                    "gemini-2.5-flash",
-                    "gemini-2.0-flash",
-                    "Custom (type your own)"
-                ]
-            gemini_model_choice = st.selectbox(
-                "Model",
-                gemini_models,
-                index=0,
-                help="Gemini 3.8 Flash is Google's latest recommended high-speed instruction model.",
-            )
-            st.caption("✨ **gemini-3.8-flash** is Google's state-of-the-art fast multimodal model with free tier quotas.")
-            if gemini_model_choice == "Custom (type your own)":
-                gemini_model = st.text_input("Enter Gemini Model ID", value="gemini-3.8-flash")
-            else:
-                gemini_model = gemini_model_choice
-            hf_token = None
-            hf_model = None
-            ollama_model = None
-            groq_api_key = None
-            groq_model = None
-        elif provider_choice == "Groq (recommended & fast)":
-            gemini_api_key = None
-            gemini_model = None
-            groq_api_key = st.text_input(
-                "Groq API key (GROQ_API_KEY)",
-                value=os.getenv("GROQ_API_KEY", ""),
-                type="password",
-                help="Create for free at console.groq.com/keys.",
-            )
-            live_models = get_available_groq_models(groq_api_key)
-            if live_models:
-                prioritized = [m for m in ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b") if m in live_models]
-                rest = [m for m in live_models if m not in prioritized]
-                options = prioritized + rest + ["Custom (type your own)"]
-            else:
-                options = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b", "Custom (type your own)"]
-
-            groq_model_choice = st.selectbox(
-                "Model",
-                options,
-                index=0,
-                help="Models available on your Groq account. openai/gpt-oss-20b is recommended.",
-            )
-            st.caption("⚡ **openai/gpt-oss-20b** is the lightest, fastest instruction model on Groq (no thinking token overhead).")
-            if groq_model_choice == "Custom (type your own)":
-                groq_model = st.text_input("Enter Groq Model ID", value="openai/gpt-oss-20b")
-            else:
-                groq_model = groq_model_choice
-            hf_token = None
-            hf_model = None
-            ollama_model = None
-        elif provider_choice == "Hugging Face (paid)":
-            gemini_api_key = None
-            gemini_model = None
-            hf_token = st.text_input(
-                "Hugging Face token (HF_TOKEN)",
-                type="password",
-                help="Create at huggingface.co/settings/tokens. Requires Inference Providers credits.",
-            )
-            hf_model = st.text_input(
-                "Model (optional)",
-                value="Qwen/Qwen3-235B-A22B-Instruct-2507",
-                help="Default is the project's configured model. Change only if you know another model supports structured JSON output.",
-            )
-            ollama_model = None
-            groq_api_key = None
-            groq_model = None
+        live_gemini = get_available_gemini_models(gemini_api_key)
+        if live_gemini:
+            prioritized = [m for m in ("gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash", "gemini-2.0-flash") if m in live_gemini]
+            rest = [m for m in live_gemini if m not in prioritized]
+            gemini_models = (prioritized or ["gemini-3.8-flash"]) + rest + ["Custom (type your own)"]
         else:
-            gemini_api_key = None
-            gemini_model = None
-            st.caption("Make sure Ollama is running: `ollama serve` and the model is pulled.")
-            ollama_model = st.text_input(
-                "Ollama model name",
-                value="qwen3:8b",
-                help="Must be already pulled via `ollama pull <model>`. Runs at http://127.0.0.1:11434",
-            )
-            hf_token = None
-            hf_model = None
-            groq_api_key = None
-            groq_model = None
-    else:
-        st.caption("No context → demo policy used (works offline, no model needed).")
-        gemini_api_key = None
-        gemini_model = None
+            gemini_models = [
+                "gemini-3.8-flash",
+                "gemini-3.8-pro",
+                "gemini-2.5-flash",
+                "gemini-2.0-flash",
+                "Custom (type your own)"
+            ]
+        gemini_model_choice = st.selectbox(
+            "Model",
+            gemini_models,
+            index=0,
+            help="Gemini 3.8 Flash is Google's latest recommended high-speed instruction model.",
+        )
+        st.caption("✨ **gemini-3.8-flash** is Google's state-of-the-art fast multimodal model with free tier quotas.")
+        if gemini_model_choice == "Custom (type your own)":
+            gemini_model = st.text_input("Enter Gemini Model ID", value="gemini-3.8-flash")
+        else:
+            gemini_model = gemini_model_choice
         hf_token = None
         hf_model = None
         ollama_model = None
         groq_api_key = None
         groq_model = None
-        provider_choice = None
+    elif provider_choice == "Groq (recommended & fast)":
+        gemini_api_key = None
+        gemini_model = None
+        groq_api_key = st.text_input(
+            "Groq API key (GROQ_API_KEY)",
+            value=os.getenv("GROQ_API_KEY", ""),
+            type="password",
+            help="Create for free at console.groq.com/keys.",
+        )
+        live_models = get_available_groq_models(groq_api_key)
+        if live_models:
+            prioritized = [m for m in ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b") if m in live_models]
+            rest = [m for m in live_models if m not in prioritized]
+            options = prioritized + rest + ["Custom (type your own)"]
+        else:
+            options = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b", "Custom (type your own)"]
+
+        groq_model_choice = st.selectbox(
+            "Model",
+            options,
+            index=0,
+            help="Models available on your Groq account. openai/gpt-oss-20b is recommended.",
+        )
+        st.caption("⚡ **openai/gpt-oss-20b** is the lightest, fastest instruction model on Groq (no thinking token overhead).")
+        if groq_model_choice == "Custom (type your own)":
+            groq_model = st.text_input("Enter Groq Model ID", value="openai/gpt-oss-20b")
+        else:
+            groq_model = groq_model_choice
+        hf_token = None
+        hf_model = None
+        ollama_model = None
+    elif provider_choice == "Hugging Face (paid)":
+        gemini_api_key = None
+        gemini_model = None
+        hf_token = st.text_input(
+            "Hugging Face token (HF_TOKEN)",
+            type="password",
+            help="Create at huggingface.co/settings/tokens. Requires Inference Providers credits.",
+        )
+        hf_model = st.text_input(
+            "Model (optional)",
+            value="Qwen/Qwen3-235B-A22B-Instruct-2507",
+            help="Default is the project's configured model. Change only if you know another model supports structured JSON output.",
+        )
+        ollama_model = None
+        groq_api_key = None
+        groq_model = None
+    else:
+        gemini_api_key = None
+        gemini_model = None
+        st.caption("Make sure Ollama is running: `ollama serve` and the model is pulled.")
+        ollama_model = st.text_input(
+            "Ollama model name",
+            value="qwen3:8b",
+            help="Must be already pulled via `ollama pull <model>`. Runs at http://127.0.0.1:11434",
+        )
+        hf_token = None
+        hf_model = None
+        groq_api_key = None
+        groq_model = None
 
     st.divider()
 
@@ -900,7 +911,7 @@ with st.sidebar:
 
 st.title("Text Dataset Quality Auditor")
 st.markdown(
-    "Dataset + business context → AI selects a quality policy → "
+    "Dataset + business context → LLM dynamically synthesizes quality policy → "
     "deterministic local checks → weighted score + blocking gates → report"
 )
 
@@ -910,12 +921,12 @@ if not run_btn:
     c1, c2, c3 = st.columns(3)
     with c1:
         st.subheader("📂 Dataset")
-        st.markdown("Upload a dataset (`.csv`, `.tsv`, `.json`, `.jsonl`, `.parquet`, `.arrow`, `.txt`) with `text`, `label`, and `split` columns — or pick a bundled benchmark.")
+        st.markdown("Upload a dataset (`.csv`, `.tsv`, `.json`, `.jsonl`, `.parquet`, `.arrow`, `.txt`) or pick a bundled benchmark.")
     with c2:
         st.subheader("📝 Business context")
         st.markdown(
-            "Describe what you're building. The AI reads this and selects which checks "
-            "to run and how much weight each gets. Leave blank to use the demo policy."
+            "Describe your application requirements. The LLM evaluates this description to "
+            "dynamically synthesize which checks to run, threshold tolerances, and fatal blocking gates."
         )
     with c3:
         st.subheader("📊 Report")
@@ -931,28 +942,46 @@ if dataset_mode == "Upload custom dataset" and uploaded_file is None:
     st.error("Please upload a dataset file before running the audit.")
     st.stop()
 
-if use_ai and provider_choice == "Google AI Studio / Gemini (free tier)" and not (gemini_api_key and gemini_api_key.strip()):
+if uploaded_file is not None and detected_cols:
+    if label_col.strip() and label_col.strip() not in detected_cols:
+        st.error(
+            f"Configured label column '{label_col.strip()}' was not found in dataset. "
+            f"Available columns: {', '.join(detected_cols)}. Leave blank if unlabeled."
+        )
+        st.stop()
+    if split_col.strip() and split_col.strip() not in detected_cols:
+        st.error(
+            f"Configured split column '{split_col.strip()}' was not found in dataset. "
+            f"Available columns: {', '.join(detected_cols)}. Leave blank if dataset has no split column."
+        )
+        st.stop()
+
+if not business_context.strip():
+    st.error("Please provide a business context description. The quality policy must be synthesized by the LLM.")
+    st.stop()
+
+if provider_choice == "Google AI Studio / Gemini (free tier)" and not (gemini_api_key and gemini_api_key.strip()):
     st.error(
         "You selected Google AI Studio but didn't enter an API key. "
-        "Add your GEMINI_API_KEY (from aistudio.google.com/app/apikey), switch to another provider, or uncheck LLM policy generation to run with the bundled policy."
+        "Enter your GEMINI_API_KEY (from https://aistudio.google.com/app/apikey) or select another provider in the sidebar."
     )
     st.stop()
 
-if use_ai and provider_choice == "Groq (recommended & fast)" and not (groq_api_key and groq_api_key.strip()):
+if provider_choice == "Groq (recommended & fast)" and not (groq_api_key and groq_api_key.strip()):
     st.error(
         "You selected Groq but didn't enter an API key. "
-        "Add your GROQ_API_KEY (from console.groq.com/keys), switch to Local Ollama, or clear the business context to use the demo policy."
+        "Enter your GROQ_API_KEY (from https://console.groq.com/keys) or select another provider in the sidebar."
     )
     st.stop()
 
-if use_ai and provider_choice == "Hugging Face (paid)" and not hf_token:
+if provider_choice == "Hugging Face (paid)" and not (hf_token and hf_token.strip()):
     st.error(
         "You selected Hugging Face but didn't enter a token. "
-        "Add your HF_TOKEN, switch to Groq or Local Ollama, or clear the business context to use the demo policy."
+        "Enter your HF_TOKEN or select another provider in the sidebar."
     )
     st.stop()
 
-if use_ai and provider_choice == "Local Ollama (free)" and not ollama_model.strip():
+if provider_choice == "Local Ollama (free)" and not (ollama_model and ollama_model.strip()):
     st.error("Enter an Ollama model name (e.g. `qwen3:8b`).")
     st.stop()
 
@@ -977,7 +1006,7 @@ with st.spinner("Running audit…"):
                 split_col=split_col,
                 allowed_labels_path=_labels_path,
                 out_dir=out_dir,
-                use_case=business_context if use_ai else None,
+                use_case=business_context.strip(),
                 provider_choice=provider_choice,
                 hf_token=hf_token,
                 hf_model=hf_model,
@@ -986,7 +1015,7 @@ with st.spinner("Running audit…"):
                 groq_model=groq_model,
                 gemini_api_key=gemini_api_key,
                 gemini_model=gemini_model,
-                policy_path=_policy_path,
+                policy_path=None,
                 require_redacted=_require_redacted,
             )
     except Exception as exc:

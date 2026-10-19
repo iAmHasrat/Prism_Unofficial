@@ -206,5 +206,16 @@ class AuditorTest(unittest.TestCase):
         self.assertIn(3, r_text["issue_row_ids"])
         self.assertIn("blank or whitespace-only", r_text["cause"].lower())
 
+    def test_plain_text_file_without_labels_evaluates_successfully(self):
+        txt_path = self.root / "sample.txt"
+        txt_path.write_text("Sentence 1\nSentence 2\nSentence 3\n", encoding="utf-8")
+        c = Config(text_column="text", label_column=None, split_column=None)
+        d = LocalDataset(txt_path, c)
+        self.addCleanup(d.close)
+        pol = policy(d)
+        res = evaluate(d, pol)
+        self.assertEqual(res["quality_index"], 100)
+        self.assertEqual(d.count, 3)
+
 
 if __name__ == "__main__": unittest.main()

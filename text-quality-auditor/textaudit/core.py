@@ -134,8 +134,12 @@ class LocalDataset:
         batch = []
         required = [x for x in (c.text_column, c.label_column, c.split_column, c.group_column) if x]
         for i, row in enumerate(iter_rows(self.path, text_column=c.text_column), 1):
-            if any(k not in row for k in required):
-                raise ValueError(f"Row {i} is missing a configured column.")
+            missing_cols = [k for k in required if k not in row]
+            if missing_cols:
+                raise ValueError(
+                    f"Row {i} is missing configured column(s): {', '.join(repr(k) for k in missing_cols)}. "
+                    f"Available columns: {', '.join(repr(k) for k in row.keys())}."
+                )
             text = row[c.text_column]
             typ = isinstance(text, str)
             nonempty = typ and bool(text.strip())
